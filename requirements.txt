@@ -1,0 +1,36 @@
+# Core
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+
+# Data processing
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# Document parsing
+pypdf>=3.0.0
+python-docx>=1.0.0
+
+
+
+# LLM
+openai>=1.0.0
+anthropic>=0.18.0
+langdetect>=1.0.9
+
+# RAG
+chromadb>=0.4.0
+sentence-transformers>=2.2.0
+
+# Telegram bot
+aiogram>=3.0.0
+
+# Local LLM (optional)
+# llama-cpp-python>=0.2.0
+
+# CLI
+rich>=13.0.0
+prompt_toolkit>=3.0.0
+
+# API (optional, for production)
+# fastapi>=0.109.0
+# uvicorn>=0.27.0
