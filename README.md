@@ -19,22 +19,22 @@ A Telegram bot for writers: creative block, ideas, exercises, feedback, and styl
 | `/lang`    | Switch language (ru / en)      |
 | `/help`    | Command list                   |
 
-and more!
+...and much more!
 
 ## Setup
 
-1. **Clone / copy** the project.
+1. Clone / copy the project.
 
-2. **Create `.env`** from `.env.example`:
+2. Create `.env` from `.env.example`:
    - `TELEGRAM_BOT_TOKEN` — from [@BotFather](https://t.me/BotFather)
    - `OPENAI_API_KEY` and optionally `OPENAI_API_BASE` (e.g. Together AI)
 
-3. **Install dependencies:**
+3. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
 
-4. **Run the bot:**
+4. Run the bot:
    ```bash
    cd src
    python telegram_bot.py
