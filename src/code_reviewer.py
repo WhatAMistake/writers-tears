@@ -22,14 +22,18 @@ TRACKED_FILES = [
     "src/word_stats.py",
 ]
 
-# Existing commands that should NOT be mentioned as "new" in changelogs
+# Existing commands that should NOT be mentioned as new in changelogs
 EXISTING_COMMANDS = [
     "start", "help", "lang", "switchlang", "reset", "block", "develop",
     "character", "dialogue", "prompt", "idea", "feedback", "style", "roast",
     "praise", "corrector", "editor", "count_me", "stats", "lobster", "pun",
     "porko", "methodique", "methodichque", "cite", "cite_off", "cite_on",
-    "cite_when", "summary", "cry_baby", "dev_feedback", "done", "confo_enable37", "upload"
+    "cite_when", "summary", "cry_baby", "dev_feedback", "done", "confo_enable37", "upload",
+    # Internal functions that should NOT appear in changelog
+    "get_writing_prompt", "generate_idea", "develop_idea", "character_help",
+    "dialogue_help", "methodique_random", "cry_baby_reply", "lobster_love"
 ]
+
 
 # Witty comments for changelog
 WITTY_COMMENTS = [
@@ -165,27 +169,27 @@ def generate_changelog_with_llm(writer_bot, changed_files: List[Tuple[str, str, 
     
     diff_content = "\n\n".join(diff_sections)
     
+    # Known existing commands to prevent hallucination
+    known_cmds = ", ".join(EXISTING_COMMANDS[:12])
+    
     if lang == "ru":
-        prompt = f"""Ты — циничный PM с 20-летним стажем, пишущий notes к релизу. Твой стиль: саркастичный, но информативный. Без воды и технического жаргона.
+        prompt = f"""Ты пишешь changelog для пользователей.
 
-АНАЛИЗИРУЙ КОД и выяви что изменилось для ПОЛЬЗОВАТЕЛЯ:
-- Новые команды (функции cmd_*) — что делает команда простыми словами
-- Улучшения существующих команд — что стало лучше
-- Исправленные баги — что чинили
-- Новые возможности — как это поможет пользователю
+СТРОГИЕ ПРАВИЛА:
+1) Пиши ТОЛЬКО о реальных изменениях в коде - что именно починили или улучшили
+2) Если изменений мало → напиши ОДНО предложение или пропусти
+3) НИКОГДА не придумывай новые команды или фичи которых нет в коде!
+4) Не вымучивай пункты - максимум 2-3 если есть реальные изменения
+5) Фокусируйся на: исправленных багах, починенных командах, улучшенной логике работы
 
-ПРАВИЛА:
-1. Пиши ТОЛЬКО о реальных изменениях в коде ниже
-2. НЕ придумывай команды или фичи которых нет
-3. Пиши простым языком, как для друга, не для программиста
-4. Максимум 5 пунктов, только значимое
-5. Формат: "- Краткое название: что изменилось и зачем это пользователю"
-6. Без повторов "- Что:" в начале, каждый пункт должен быть уникальным
+УЖЕ СУЩЕСТВУЮЩИЕ: {known_cmds}...
 
-Изменённые файлы:
+Изменённые файлы ({num_changes} шт.):
+
 {diff_content}
 
-Напиши changelog на русском. Будь конкретным, но сохраняй лёгкий сарказм в духе "мы это сделали, и вроде работает"."""
+Напиши changelog на русском. Будь конкретным - опиши что именно починили, но сохраняй лёгкий сарказм в духе "мы это сделали, и вроде работает"."""
+
     else:
         prompt = f"""You are a cynical PM with 20 years of experience writing release notes. Your style: sarcastic but informative. No fluff or technical jargon.
 

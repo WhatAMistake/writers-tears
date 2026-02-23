@@ -113,15 +113,52 @@ class WriterBot:
             print("openai not installed. pip install openai")
             self.client = None
 
+    def _clear_prompts_cache(self) -> None:
+        """Clear the prompts data cache to force reload on next access."""
+        self._prompts_data = None
+        print(f"[PROMPTS] Cache cleared for language '{self.language}'")
+
     def _load_prompts_data(self) -> dict:
         if self._prompts_data is not None:
             return self._prompts_data
-        data_path = Path(__file__).parent.parent / "data" / "writing_prompts.json"
-        if data_path.exists():
-            with open(data_path, "r", encoding="utf-8") as f:
-                self._prompts_data = json.load(f)
-        else:
+        
+        # Try language-specific file first
+        lang_suffix = f".{self.language}" if self.language != "en" else ""
+        data_path = Path(__file__).parent.parent / "data" / f"writing_prompts{lang_suffix}.json"
+        
+        print(f"[PROMPTS] Trying to load: {data_path}")
+        
+        # Fall back to default file if language-specific doesn't exist
+        if not data_path.exists():
+            print(f"[PROMPTS] Language-specific file not found, falling back to default")
+            data_path = Path(__file__).parent.parent / "data" / "writing_prompts.json"
+            print(f"[PROMPTS] Trying default: {data_path}")
+        
+        try:
+            if data_path.exists():
+                print(f"[PROMPTS] Loading from: {data_path}")
+                with open(data_path, "r", encoding="utf-8") as f:
+                    self._prompts_data = json.load(f)
+                print(f"[PROMPTS] Loaded successfully. Keys: {list(self._prompts_data.keys())}")
+                # Check if idea keys exist
+                for key in ["idea_genre", "idea_setting", "idea_conflict"]:
+                    if key in self._prompts_data:
+                        print(f"[PROMPTS] {key}: {len(self._prompts_data[key])} items")
+                    else:
+                        print(f"[PROMPTS] WARNING: {key} not found in prompts data!")
+            else:
+                print(f"[PROMPTS] File not found: {data_path}")
+                print(f"[PROMPTS] Falling back to default prompts data")
+                self._prompts_data = self._default_prompts_data()
+        except json.JSONDecodeError as e:
+            print(f"[PROMPTS] JSON parse error in {data_path}: {e}")
+            print(f"[PROMPTS] Falling back to default prompts data")
             self._prompts_data = self._default_prompts_data()
+        except Exception as e:
+            print(f"[PROMPTS] Error loading {data_path}: {e}")
+            print(f"[PROMPTS] Falling back to default prompts data")
+            self._prompts_data = self._default_prompts_data()
+        
         return self._prompts_data
 
     def _default_prompts_data(self) -> dict:
@@ -471,8 +508,8 @@ class WriterBot:
         return random.choice(exercises)
 
     def generate_idea(self) -> str:
-        # Always use default prompts data to ensure correct language
-        data = self._default_prompts_data()
+        # Load prompts data from file (language-specific if available)
+        data = self._load_prompts_data()
         genre = random.choice(data.get("idea_genre", ["literary"]))
         setting = random.choice(data.get("idea_setting", ["small town"]))
         conflict = random.choice(data.get("idea_conflict", ["secret that would destroy the family"]))
@@ -984,9 +1021,9 @@ IMPORTANT: Clean text only. No asterisks, no emojis, no decorative elements, no 
         out = self.generate_response("Lobster monologue.", temporary_system_instruction=instr)
         print(f"[LOBSTER] Regular response: {out[:150] if out else 'None'}...")
         if not out or out.startswith("Error"):
-            # Parse fallback to return proper list
-            parts = [p.strip() for p in " ".join(fallback).split("---MESSAGE---") if p.strip()]
-            return parts if parts else fallback[::2]  # Take every other (non-separator) element
+            # Extract actual messages from fallback list (elements at even indices: 0, 2, 4...)
+            messages = [fallback[i].strip() for i in range(0, len(fallback), 2) if fallback[i].strip()]
+            return messages if messages else ["the lobster is silent..."]  # Last resort fallback
         
         parts = [p.strip() for p in out.split("---MESSAGE---") if p.strip()]
         print(f"[LOBSTER] Parsed parts: {len(parts)} messages")
@@ -1089,8 +1126,8 @@ Output ONLY the pun, no explanation.""" + clean_suffix
         if not self.client:
             return self.get_random_prompt()
         
-        # Get some existing prompts as examples - use default to ensure correct language
-        data = self._default_prompts_data()
+        # Get some existing prompts as examples - use language-specific data
+        data = self._load_prompts_data()
         existing = data.get("prompts", [])[:5]
         examples = "\n".join(f"- {p}" for p in existing)
         

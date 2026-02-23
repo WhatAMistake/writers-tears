@@ -13,7 +13,22 @@ from typing import Optional, BinaryIO
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
-load_dotenv()
+
+# Try multiple locations for .env file (server path first, then relative)
+env_paths = [
+    Path("/root/bot2/writers-tears-bot/.env"),  # Server production path
+    Path(__file__).parent.parent / ".env",      # Relative path from src/
+    Path.cwd() / ".env",                        # Current working directory
+]
+for env_path in env_paths:
+    if env_path.exists():
+        load_dotenv(env_path)
+        print(f"Loaded .env from: {env_path}")
+        break
+else:
+    load_dotenv()  # Fallback to default behavior
+    print("Warning: .env file not found in standard locations, using default load_dotenv")
+
 
 # Add src to path for imports when running as module
 import sys
@@ -55,7 +70,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 from init_code_cache import init_cache
 
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en")
-DEV_ID = int(os.getenv("DEV_ID", "0"))  # Developer ID for feedback from .env
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # Developer ID for feedback from .env
+print(f"DEBUG: ADMIN_ID loaded = {ADMIN_ID}")
+
 
 
 def get_main_keyboard(lang: str = "en") -> ReplyKeyboardMarkup:
@@ -90,9 +107,9 @@ class TelegramWriterBot:
         self.user_states: dict[int, str] = {}
         self.last_user_message: dict[int, str] = {}
         self.accumulated_text: dict[int, str] = {}  # For multi-message input
-        self.admin_id = int(os.getenv("ADMIN_ID", "0"))
         
         # Error tracking for spam protection
+
         self.user_error_count: dict[int, int] = {}  # consecutive errors per user
         self.user_error_cooldown: dict[int, datetime] = {}  # cooldown until time
         self.error_cooldown_seconds: int = 30  # cooldown after errors
@@ -102,10 +119,16 @@ class TelegramWriterBot:
         self.llm_api_base = llm_api_base
         self.use_rag = use_rag
         self.bot_username: Optional[str] = None
+        self.bot_user_id: Optional[int] = None
         
         # Auto-activation tracking for group chats (chat_id -> last_activation_time)
         self.last_auto_activation: dict[int, datetime] = {}
         self.auto_activation_task: Optional[asyncio.Task] = None
+        
+        # Auto porko/lobster in group chats - track group chats for random messages
+        self.group_chats: set[int] = set()  # chat_ids where bot is active
+        self.last_porko_lobster: dict[int, datetime] = {}  # last time porko/lobster sent per chat
+        self.porko_lobster_task: Optional[asyncio.Task] = None
         
         # Group chat availability toggle (admin only)
         self.group_chats_enabled: bool = True
@@ -120,6 +143,9 @@ class TelegramWriterBot:
         self.AUTO_DISABLE_DAYS: int = 17 # Days of inactivity before auto-disable
         self.pending_changelog: Optional[str] = None  # Store changelog to show to users
         
+        # Track all users for broadcasts (not just those with lang prefs)
+        self.all_users: set[int] = set()
+        
         # User preferences persistence (copied from therapist bot)
         self.prefs_path = Path(__file__).parent.parent / "data" / "user_prefs.json"
         self._load_user_prefs()
@@ -131,7 +157,9 @@ class TelegramWriterBot:
         # Unified state configuration: state_name -> (min_length, handler_method_name or None)
         # This eliminates duplication across waiting_states, accumulation_states, and state_handlers
         self.STATE_CONFIG = {
+            # Accumulation states (processed on /done)
             "feedback": (20, "feedback_on_text"),
+
             "style": (20, "analyze_style"),
             "roast": (50, "roast"),
             "praise": (50, "praise"),
@@ -146,8 +174,12 @@ class TelegramWriterBot:
             "summary_wait": (10, None),  # Special handling with buttons
             "dev_feedback_wait": (1, None),  # Special handling
         }
+
+        # Additional states for summary format selection (after /done or after /summary on file)
+        self.SUMMARY_FORMAT_STATE = "summary_format"
         
         # Discussion states: for discussing results while keeping tool context
+
         # Maps discussion state -> (original tool state, instruction_key)
         self.DISCUSSION_STATES = {
             "feedback_discuss": ("feedback", "instr_feedback"),
@@ -161,9 +193,75 @@ class TelegramWriterBot:
         }
         
         # States that require user input (waiting states)
-        self.WAITING_STATES = set(self.STATE_CONFIG.keys()) | set(self.DISCUSSION_STATES.keys()) | {"cry_baby"}
+        self.WAITING_STATES = set(self.STATE_CONFIG.keys()) | set(self.DISCUSSION_STATES.keys()) | {"cry_baby", "document_wait", self.SUMMARY_FORMAT_STATE}
+
 
         self._register_handlers()
+
+    async def run(self):
+        """Start the bot and check for code changes to generate changelog."""
+        # Get bot info
+        try:
+            bot_info = await self.bot.get_me()
+            self.bot_username = bot_info.username
+            self.bot_user_id = bot_info.id
+            print(f"Bot started: @{self.bot_username} (ID: {self.bot_user_id})")
+        except Exception as e:
+            print(f"Failed to get bot info: {e}")
+        
+        # Check for code changes and generate changelog
+        project_root = Path(__file__).parent.parent
+        try:
+            # Create a temporary writer bot for LLM calls
+            wb = WriterBot(
+                model=self.llm_model,
+                api_key=self.llm_api_key,
+                api_base=self.llm_api_base,
+                use_rag=False,  # No RAG needed for changelog
+                language="ru",
+            )
+            changelog = check_and_generate_changelog(
+                project_root=project_root,
+                writer_bot=wb,
+                admin_id=ADMIN_ID,
+                lang="ru",
+                should_save_hashes=True
+            )
+            if changelog:
+                # Store changelog and wait for admin confirmation
+                self.pending_changelog = changelog
+                # Send preview to admin for confirmation
+                if ADMIN_ID:
+                    preview = (
+                        f"<b>Changelog Preview</b>\n\n"
+                        f"{changelog[:300]}{'...' if len(changelog) > 300 else ''}\n\n"
+                        f"Recipients: {len(self.all_users)}\n\n"
+                        f"Send to all users? Reply <b>yes</b> to confirm."
+                    )
+
+                    try:
+                        await self.bot.send_message(
+                            ADMIN_ID,
+                            preview,
+                            parse_mode="HTML"
+                        )
+                        self.user_states[ADMIN_ID] = "changelog_confirm"
+                        print(f"Changelog generated, waiting for admin {ADMIN_ID} confirmation")
+                    except Exception as e:
+                        print(f"Failed to send changelog preview to admin: {e}")
+                else:
+                    print("Changelog generated but no ADMIN_ID set, skipping broadcast")
+
+
+
+        except Exception as e:
+            print(f"Changelog check failed: {e}")
+        
+        # Start polling
+        # Start background task for auto porko/lobster in group chats
+        self.porko_lobster_task = asyncio.create_task(self._porko_lobster_background_loop())
+        
+        await self.dp.start_polling(self.bot)
 
     def _load_user_prefs(self):
         """Load user preferences from JSON file."""
@@ -173,14 +271,27 @@ class TelegramWriterBot:
                 with open(self.prefs_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     self.user_langs = {int(k): v for k, v in data.get('user_langs', {}).items()}
+                    self.all_users = set(int(k) for k in data.get('all_users', []))
+                    
+                    # Migrate old users: add all user_langs keys to all_users
+                    # This ensures existing users get broadcasts without needing to /start again
+                    for user_id in self.user_langs.keys():
+                        if user_id not in self.all_users:
+                            self.all_users.add(user_id)
+                    
+                    # Save if we added any users
+                    if len(self.all_users) > len(set(int(k) for k in data.get('all_users', []))):
+                        self._save_user_prefs()
         except Exception:
             self.user_langs = getattr(self, "user_langs", {}) or {}
+            self.all_users = getattr(self, "all_users", set()) or set()
 
     def _save_user_prefs(self):
         """Save user preferences to JSON file."""
         try:
             payload = {
                 'user_langs': {str(k): v for k, v in self.user_langs.items()},
+                'all_users': list(self.all_users),
             }
             with open(self.prefs_path, 'w', encoding='utf-8') as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -206,6 +317,8 @@ class TelegramWriterBot:
             if sess.language != lang:
                 sess.language = lang
                 sess.system_prompt = sess._load_system_prompt()
+                # Clear prompts cache to load new language data
+                sess._clear_prompts_cache()
         
         return self.sessions[user_id]
 
@@ -345,7 +458,12 @@ class TelegramWriterBot:
         async def cmd_confo_enable37(message: types.Message):
             await self._handle_confo_toggle(message)
 
+        @self.dp.message(Command("debug"))
+        async def cmd_debug(message: types.Message):
+            await self._handle_debug(message)
+
         @self.dp.message(Command("upload"))
+
         async def cmd_upload(message: types.Message):
             await self._handle_upload_cmd(message)
 
@@ -430,6 +548,10 @@ class TelegramWriterBot:
         name = message.from_user.first_name or "Writer"
         self.user_states[user_id] = "chat"
         
+        # Track all users for broadcasts
+        self.all_users.add(user_id)
+        self._save_user_prefs()
+        
         # Set language from Telegram locale on first start, but don't override saved preference
         tg_lang = (message.from_user.language_code or "").lower()
         if user_id not in self.user_langs:
@@ -457,11 +579,8 @@ class TelegramWriterBot:
         lang = self.user_langs.get(user_id, DEFAULT_LANG)
         welcome = t(lang, "welcome", name=name)
 
-        # Show pending changelog to all users if available
-        if self.pending_changelog:
-            await message.answer(self.pending_changelog, parse_mode="HTML")
-
         await message.answer(welcome, reply_markup=get_main_keyboard(lang), parse_mode="HTML")
+
 
     async def _handle_help(self, message: types.Message):
 
@@ -487,6 +606,8 @@ class TelegramWriterBot:
                 sess = self.sessions[user_id]
                 sess.language = args
                 sess.system_prompt = sess._load_system_prompt()
+                # Clear prompts cache to load new language data
+                sess._clear_prompts_cache()
             # Persist
             self._save_user_prefs()
             await message.answer(t(args, "lang_set", language=args), reply_markup=get_main_keyboard(args))
@@ -506,6 +627,8 @@ class TelegramWriterBot:
             sess = self.sessions[user_id]
             sess.language = new_lang
             sess.system_prompt = sess._load_system_prompt()
+            # Clear prompts cache to load new language data
+            sess._clear_prompts_cache()
         
         # Persist
         self._save_user_prefs()
@@ -812,9 +935,18 @@ class TelegramWriterBot:
         lang = self.user_langs.get(user_id, DEFAULT_LANG)
         await message.answer(t(lang, "lobster_typing"))
         chunks = self._get_writer_bot(user_id).lobster()
+        
+        # Check if lobster returned valid chunks
+        if not chunks:
+            # Fallback if lobster is silent
+            fallback = "the lobster is silent..." if lang == "en" else "лобстер молчит..."
+            await message.answer(fallback)
+            return
+        
         for chunk in chunks:
-            await message.answer(chunk)
-            await asyncio.sleep(0.8)
+            if chunk and chunk.strip():  # Skip empty chunks
+                await message.answer(chunk)
+                await asyncio.sleep(0.8)
 
     async def _handle_pun(self, message: types.Message):
         user_id = message.from_user.id
@@ -831,6 +963,73 @@ class TelegramWriterBot:
         wb = self._get_writer_bot(user_id)
         reply = wb.porko()
         await message.answer(reply)
+
+    def _should_respond_in_group(self, message: types.Message) -> tuple[bool, str]:
+        """Check if bot should respond in group chat."""
+        text = (message.text or "").strip()
+        
+        # Always respond to commands
+        if text.startswith("/"):
+            return True, text
+            
+        # Check if bot is mentioned
+        if message.entities:
+            for entity in message.entities:
+                if entity.type == "mention":
+                    mention = text[entity.offset:entity.offset + entity.length]
+                    if self.bot_username and mention.lower() == f"@{self.bot_username.lower()}":
+                        # Remove mention from text
+                        clean_text = text[:entity.offset] + text[entity.offset + entity.length:]
+                        return True, clean_text.strip()
+        
+        # Check if replying to bot's message
+        if message.reply_to_message and message.reply_to_message.from_user:
+            if self.bot_user_id and message.reply_to_message.from_user.id == self.bot_user_id:
+                return True, text
+        
+        # In private chats, always respond
+        if message.chat.type == "private":
+            return True, text
+            
+        return False, text
+
+    def _track_chat_for_auto_activation(self, chat_id: int):
+        """Track group chat activity for auto-activation."""
+        self.last_auto_activation[chat_id] = datetime.now()
+
+    async def _process_update_broadcast(self):
+        """Process pending update changelog broadcast to all users."""
+        if not getattr(self, "pending_changelog", None):
+            return
+
+        changelog = self.pending_changelog
+        sent_count = 0
+        failed_count = 0
+        
+        for user_id in list(self.all_users):
+            try:
+                await self.bot.send_message(
+                    user_id,
+                    f"<b>Обновление бота</b>\n\n{changelog}",
+                    parse_mode="HTML"
+                )
+
+                # Включаем ежедневные цитаты для всех пользователей после обновления
+                self.user_cite_enabled[user_id] = True
+                self.user_cite_last_time[user_id] = datetime.now() - timedelta(hours=23)  # Отправит цитату скоро
+                
+                sent_count += 1
+            except Exception:
+                failed_count += 1
+        
+        # Сохраняем настройки пользователей
+        self._save_user_prefs()
+        
+        # Clear pending changelog
+        self.pending_changelog = None
+        
+        return sent_count, failed_count
+
 
     async def _handle_upload_cmd(self, message: types.Message):
         """Handle /upload command - prompt user to send a file."""
@@ -1080,12 +1279,12 @@ class TelegramWriterBot:
     async def _handle_summary(self, message: types.Message):
         user_id = message.from_user.id
         lang = self.user_langs.get(user_id, DEFAULT_LANG)
+        state = self.user_states.get(user_id, "chat")
+        full_text = (self.accumulated_text.get(user_id) or "").strip()
 
-        full_text = self.accumulated_text.get(user_id)
-
-    # Если текст уже есть (из файла или накопления)
-        if full_text:
-            self.user_states[user_id] = "summary_wait"
+        # Сразу выбор формата — ТОЛЬКО если текст пришёл из файла (document_wait)
+        if state == "document_wait" and full_text:
+            self.user_states[user_id] = self.SUMMARY_FORMAT_STATE
 
             builder = ReplyKeyboardBuilder()
             builder.add(KeyboardButton(text=t(lang, "btn_summary_sentence")))
@@ -1100,17 +1299,25 @@ class TelegramWriterBot:
             )
             return
 
-    # Иначе обычный режим — ждем текст
+        # Иначе обычный режим — начинаем накопление с чистого листа
         self.accumulated_text[user_id] = ""
         self.user_states[user_id] = "summary_wait"
 
         await message.answer(t(lang, "summary_prompt"))
+
+
     
     async def _handle_summary_choice(self, message: types.Message, text: str):
         user_id = message.from_user.id
         lang = self.user_langs.get(user_id, DEFAULT_LANG)
+        state = self.user_states.get(user_id, "chat")
+
+        # Выбор формата разрешаем только когда мы реально в режиме выбора формата
+        if state != self.SUMMARY_FORMAT_STATE:
+            return False
 
         # Поддержка RU и EN независимо от текущего lang
+
         format_map = {
             t("ru", "btn_summary_sentence"): "instr_summary_one_sentence",
             t("ru", "btn_summary_paragraph"): "instr_summary_one_paragraph",
@@ -1229,12 +1436,54 @@ class TelegramWriterBot:
         self.user_states[user_id] = "cry_baby"
         await message.answer(t(lang, "cry_baby_offer"))
 
+    async def _handle_confo_toggle(self, message: types.Message):
+        """Handle /confo_enable37 command - toggle confo mode (internal admin command)."""
+        user_id = message.from_user.id
+        
+        # Only allow admin to use this command
+        if user_id != ADMIN_ID:
+            return
+        
+        # Toggle confo mode (this is an internal feature)
+
+        current_mode = getattr(self, 'confo_enabled', False)
+        
+        # Toggle the state and provide feedback about the change in status
+        if current_mode:
+            await message.answer("Confort mode disabled")
+        else:
+            await message.answer("Confort mode enabled")
+        
+        # Update and save the new configuration state
+        setattr(self, 'confo_enabled', not current_mode)
+
+    async def _handle_debug(self, message: types.Message):
+        """Handle /debug command - show environment info (admin only)."""
+        user_id = message.from_user.id
+        
+        if user_id != ADMIN_ID:
+            return  # Silently ignore non-admins
+        
+        # Show current environment status
+        debug_info = (
+            f"<b>Debug Info</b>\n\n"
+            f"ADMIN_ID: <code>{ADMIN_ID}</code>\n"
+            f"DEFAULT_LANG: <code>{DEFAULT_LANG}</code>\n"
+            f"Loaded .env: {getattr(self, '_env_loaded_path', 'unknown')}\n\n"
+            f"Bot username: @{self.bot_username or 'unknown'}\n"
+            f"Bot user ID: <code>{self.bot_user_id or 'unknown'}</code>\n"
+        )
+        
+        await message.answer(debug_info, parse_mode="HTML")
+
+
     async def _handle_admin(self, message: types.Message):
         """Handle /admin <message> — mass broadcast from admin."""
         admin_id = message.from_user.id
 
-        if admin_id != self.admin_id:
+        if admin_id != ADMIN_ID:
             return  # Silently ignore non-admins
+
 
         # Parse arguments
         parts = (message.text or "").split(None, 1)
@@ -1261,7 +1510,7 @@ class TelegramWriterBot:
         preview = (
             f"<b>Broadcast Preview</b>\n\n"
             f"{broadcast_text[:200]}{'...' if len(broadcast_text) > 200 else ''}\n\n"
-            f"Recipients: {len(self.user_langs)}\n\n"
+            f"Recipients: {len(self.all_users)}\n\n"
             f"Send? Reply <b>yes</b> to confirm."
         )
 
@@ -1276,6 +1525,7 @@ class TelegramWriterBot:
         
         # Reset state
         self.user_states[admin_id] = "chat"
+
         
         # Statistics
         sent_count = 0
@@ -1283,10 +1533,10 @@ class TelegramWriterBot:
         failed_users = []
         
         # Send status message
-        status_msg = await message.answer(f"Starting broadcast to {len(self.user_langs)} users...")
+        status_msg = await message.answer(f"Starting broadcast to {len(self.all_users)} users...")
         
         # Broadcast to all users
-        for user_id in list(self.user_langs.keys()):
+        for user_id in list(self.all_users):
             try:
                 await self.bot.send_message(
                     user_id,
@@ -1317,21 +1567,50 @@ class TelegramWriterBot:
     async def _handle_dev_feedback(self, message: types.Message):
         user_id = message.from_user.id
         lang = self.user_langs.get(user_id, DEFAULT_LANG)
-        text = (message.text or "").strip().replace("/dev_feedback", "").strip()
+        
+        # ADMIN_ID must be configured, otherwise dev feedback will always crash/throw.
+        if ADMIN_ID <= 0:
+            await message.answer(
+                "Dev feedback is not configured (ADMIN_ID is missing in .env)."
+                if lang == "en" else
+                "dev_feedback не настроен: в .env не задан ADMIN_ID (ID разработчика)."
+            )
+            self.user_states[user_id] = "chat"
+            if user_id in self.accumulated_text:
+                del self.accumulated_text[user_id]
+            return
+        
+        # Get text from message, handling both direct command and accumulated text
+        raw_text = (message.text or "").strip()
+        text = raw_text.replace("/dev_feedback", "").strip()
+        
+        # Debug info
+        print(f"dev_feedback: user={user_id}, text_len={len(text)}, raw_len={len(raw_text)}")
+        print(f"dev_feedback: accumulated_text exists={user_id in self.accumulated_text}")
+        
         if not text:
+            # No text provided - start accumulation mode
             self.user_states[user_id] = "dev_feedback_wait"
             self.accumulated_text[user_id] = ""  # Start accumulation
             await message.answer(t(lang, "dev_feedback_prompt"))
             return
-        # Send to developer
+        
+        # Text provided directly - send immediately
         try:
             user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID:{user_id}"
             dev_msg = f"Dev feedback from {user_info}:\n\n{text}"
-            await self.bot.send_message(chat_id=DEV_ID, text=dev_msg)
+            print(f"dev_feedback: sending to ADMIN_ID={ADMIN_ID}, msg_len={len(dev_msg)}")
+            await self.bot.send_message(chat_id=ADMIN_ID, text=dev_msg)
             await message.answer(t(lang, "dev_feedback_thanks"))
-        except Exception:
+        except Exception as e:
+            print(f"dev_feedback error: {e}")
             await message.answer(t(lang, "error_llm"))
         self.user_states[user_id] = "chat"
+        if user_id in self.accumulated_text:
+            del self.accumulated_text[user_id]
+
+
+
 
     async def _handle_message(self, message: types.Message):
         if not (message.text or "").strip():
@@ -1340,8 +1619,53 @@ class TelegramWriterBot:
         user_id = message.from_user.id
         chat_id = message.chat.id
         lang = self.user_langs.get(user_id, DEFAULT_LANG)
+        text = (message.text or "").strip()
+        
+        # Get state FIRST
+        state = self.user_states.get(user_id, "chat")
+        
+        # ===== SUMMARY BUTTONS CHECK (before accumulation) =====
+        # Check for summary button presses first (before they get accumulated as text)
+        if text in (
+            t(lang, "btn_summary_sentence"),
+            t(lang, "btn_summary_paragraph"),
+            t(lang, "btn_summary_two_paragraphs"),
+            t(lang, "btn_summary_detailed")
+        ):
+            if await self._handle_summary_choice(message, text):
+                return
+        # ===== END SUMMARY BUTTONS CHECK =====
+        
+        # ===== TEXT ACCUMULATION =====
+        # Check if we need to accumulate text for waiting states
+        # document_wait does NOT accumulate - it waits for a command
+        if state == "document_wait":
+            await message.answer(
+                t(lang, "document_commands_hint", 
+                  default="Выберите команду: /feedback /style /roast /praise /corrector /editor /methodique /count_me /summary")
+            )
+            return
+
+        if state in self.STATE_CONFIG:
+            # Accumulate text
+            current_acc = self.accumulated_text.get(user_id, "")
+            if current_acc:
+                self.accumulated_text[user_id] = current_acc + "\n\n" + text
+            else:
+                self.accumulated_text[user_id] = text
+
+            acc_len = len(self.accumulated_text[user_id])
+            
+            # Summary НЕ показывает кнопки тут — только после /done
+            await message.answer(t(lang, "text_accumulated", length=acc_len))
+            return
+
+        # ===== END TEXT ACCUMULATION =====
+
         
         # Check if user is in error cooldown
+
+
         now = datetime.now()
         if user_id in self.user_error_cooldown:
             if now < self.user_error_cooldown[user_id]:
@@ -1353,12 +1677,12 @@ class TelegramWriterBot:
                 self.user_error_count[user_id] = 0
         
         # Check if bot is waiting for user input (command continuation)
-        state = self.user_states.get(user_id, "chat")
         is_waiting_input = state in self.WAITING_STATES
 
         # Track group chat for auto-activation
         if message.chat.type in ("group", "supergroup"):
             self._track_chat_for_auto_activation(chat_id)
+            self.group_chats.add(chat_id)  # Track for auto porko/lobster
 
         # Check if we should respond in group chat
         # If waiting for input, always respond regardless of group rules
@@ -1381,14 +1705,23 @@ class TelegramWriterBot:
                 await message.answer("❌ Broadcast cancelled")
             return
 
-        # Check for admin confirmation (auto update broadcast)
-        if user_id == self.admin_id and hasattr(self, 'pending_update_changelogs') and text.strip().lower() in ("yes", "да", "y", "д"):
-            await message.answer("✅ Starting update broadcast...")
-            await self._process_update_broadcast()
-            await message.answer("✅ Update broadcast complete!")
+        # Check for admin confirmation (auto changelog broadcast)
+        if user_id == ADMIN_ID and state == "changelog_confirm":
+            if text.strip().lower() in ("yes", "да", "y", "д"):
+                await message.answer("✅ Starting update broadcast...")
+                sent, failed = await self._process_update_broadcast()
+                await message.answer(f"✅ Update broadcast complete! Sent: {sent}, failed: {failed}")
+            else:
+                await message.answer("❌ Update broadcast cancelled")
+                # Don't delete changelog automatically; let admin confirm later if needed
+            self.user_states[user_id] = "chat"
             return
 
+        # (old pending_update_changelogs flow removed; now uses pending_changelog + changelog_confirm)
+
+
         # Check for exact trigger word from keyboard
+
         if text in (
             t(lang, "button_methodique"),
             t(lang, "button_prompt"),
@@ -1422,59 +1755,21 @@ class TelegramWriterBot:
         if self.bot_last_activity and (now - self.bot_last_activity).total_seconds() > 3600:
             await message.answer(t(lang, "bot_returned"))
         
-        # Show pending changelog to all users (both on /start and in regular chat)
-        if self.pending_changelog:
+        # Show pending changelog to admin only for confirmation
+        if self.pending_changelog and user_id == ADMIN_ID:
             await message.answer(self.pending_changelog, parse_mode="HTML")
-            # Clear changelog after showing to user
+            # Clear changelog after showing to admin
             self.pending_changelog = None
+
         
         # Update bot's last activity timestamp
+
         self.bot_last_activity = now
         
         state = self.user_states.get(user_id, "chat")
 
-# 🔹 Сначала обрабатываем выбор формата summary
-        if state == "summary_wait" and text in (
-            t(lang, "btn_summary_sentence"),
-            t(lang, "btn_summary_paragraph"),
-            t(lang, "btn_summary_two_paragraphs"),
-            t(lang, "btn_summary_detailed")
-        ):
-            if await self._handle_summary_choice(message, text):
-                return
-        
-        # Accumulation states - append text and wait for /done
-        if state in self.STATE_CONFIG or state == "summary_wait":
-            # Accumulate text
-            current_acc = self.accumulated_text.get(user_id, "")
-            if current_acc:
-                self.accumulated_text[user_id] = current_acc + "\n\n" + text
-            else:
-                self.accumulated_text[user_id] = text
-
-            # Check if minimum length reached for immediate processing (optional)
-            # For now, always wait for /done
-            acc_len = len(self.accumulated_text[user_id])
-            
-            # For summary, show buttons immediately to allow quick finish
-            if state == "summary_wait":
-                builder = ReplyKeyboardBuilder()
-                builder.add(KeyboardButton(text=t(lang, "btn_summary_sentence")))
-                builder.add(KeyboardButton(text=t(lang, "btn_summary_paragraph")))
-                builder.add(KeyboardButton(text=t(lang, "btn_summary_two_paragraphs")))
-                builder.add(KeyboardButton(text=t(lang, "btn_summary_detailed")))
-                builder.adjust(1)
-                
-                await message.answer(
-                    t(lang, "text_accumulated", length=acc_len) + "\n" + t(lang, "summary_choose_format"),
-                    reply_markup=builder.as_markup(resize_keyboard=True)
-                )
-                return
-
-            await message.answer(t(lang, "text_accumulated", length=acc_len))
-            return
-
         if state == "cry_baby":
+
             self.user_states[user_id] = "chat"
             reply = self._get_writer_bot(user_id).cry_baby_reply()
             await message.answer(reply)
@@ -1632,39 +1927,37 @@ class TelegramWriterBot:
                 t(lang, "summary_choose_format"),
                 reply_markup=builder.as_markup(resize_keyboard=True)
             )
-            # State remains "summary_wait", but now we wait for button press
+            # Move to explicit format selection state
+            self.user_states[user_id] = self.SUMMARY_FORMAT_STATE
             return
+
 
         # Special handling for dev_feedback
         if state == "dev_feedback_wait":
             if not full_text:
                 await message.answer(t(lang, "no_text_accumulated"))
                 return
+            if ADMIN_ID <= 0:
+                await message.answer(
+                    "Dev feedback is not configured (ADMIN_ID is missing in .env)."
+                    if lang == "en" else
+                    "dev_feedback не настроен: в .env не задан ADMIN_ID (ID разработчика)."
+                )
+                self.user_states[user_id] = "chat"
+                del self.accumulated_text[user_id]
+                return
             try:
                 user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID:{user_id}"
                 dev_msg = f"Dev feedback from {user_info}:\n\n{full_text}"
-                await self.bot.send_message(chat_id=DEV_ID, text=dev_msg)
+                await self.bot.send_message(chat_id=ADMIN_ID, text=dev_msg)
                 await message.answer(t(lang, "dev_feedback_thanks"))
-        except Exception:
-            await message.answer(t(lang, "error_llm"))
-        self.user_states[user_id] = "chat"
-
+            except Exception:
+                await message.answer(t(lang, "error_llm"))
+            self.user_states[user_id] = "chat"
             del self.accumulated_text[user_id]
             return
-        
-        # Handle document_wait state - remind user of available commands
-        if state == "document_wait":
-            if not full_text:
-                await message.answer(t(lang, "no_text_accumulated"))
-                return
-            await message.answer(
-                t(lang, "document_extracted",
-                  chars=len(full_text),
-                  preview=full_text[:200] + "..." if len(full_text) > 200 else full_text,
-                  commands="/feedback /style /roast /praise /corrector /editor /methodique /count_me")
-            )
-            return
 
+        
         # Use unified STATE_CONFIG
         if state not in self.STATE_CONFIG:
             await message.answer(t(lang, "no_text_accumulated"))
@@ -1672,22 +1965,23 @@ class TelegramWriterBot:
 
         min_len, handler_method = self.STATE_CONFIG[state]
 
-        if not full_text or len(full_text) < min_len:
+        # Validate text
+        if not full_text or len(full_text.strip()) < min_len:
             await message.answer(t(lang, "text_too_short", min=min_len))
             return
 
-        # Get handler from WriterBot
-        wb = self._get_writer_bot(user_id)
         if handler_method is None:
-            await message.answer(t(lang, "no_text_accumulated"))
+            await message.answer(t(lang, "error_llm"))
             return
 
+        wb = self._get_writer_bot(user_id)
         handler = getattr(wb, handler_method, None)
         if handler is None:
             await message.answer(t(lang, "error_llm"))
             return
 
         # Process with LLM
+
         await self.bot.send_chat_action(chat_id=message.chat.id, action="typing")
         try:
             reply = handler(full_text)
@@ -1700,9 +1994,66 @@ class TelegramWriterBot:
                 await message.answer(reply + f"\n\n{t(lang, 'discuss_mode_hint')}")
             else:
                 self.user_states[user_id] = "chat"
-                await message.answer("Broadcast cancelled")
+                # Clear accumulated text after normal processing
+                if user_id in self.accumulated_text:
+                    del self.accumulated_text[user_id]
+                await message.answer(reply)
             return
 
+        except Exception:
+            await message.answer(t(lang, "error_llm"))
+            return
+
+
+    async def _porko_lobster_background_loop(self):
+        """Background task: send porko (75%) or lobster (25%) randomly every 4-20 hours in group chats."""
+        while True:
+            delay = random.randint(4, 20) * 3600
+            await asyncio.sleep(delay)
+            
+            if not hasattr(self, 'group_chats'):
+                continue
+                
+            for chat_id in list(getattr(self, 'group_chats', [])):
+                last_time = getattr(self, 'last_porko_lobster', {}).get(chat_id)
+                if last_time and (datetime.now() - last_time).total_seconds() < 4 * 3600:
+                    continue
+                
+                try:
+                    if random.random() < 0.75:
+                        wb = self._get_writer_bot(0)
+                        reply = wb.porko()
+                        await self.bot.send_message(chat_id=chat_id, text=reply)
+                    else:
+                        await self.bot.send_chat_action(chat_id=chat_id, action="typing")
+                        wb = self._get_writer_bot(0)
+                        chunks = wb.lobster()
+                        if chunks:
+                            for chunk in chunks:
+                                if chunk and chunk.strip():
+                                    await self.bot.send_message(chat_id=chat_id, text=chunk)
+                                    await asyncio.sleep(0.8)
+                        else:
+                            await self.bot.send_message(chat_id=chat_id, text="хрю")
+                    
+                    if not hasattr(self, 'last_porko_lobster'):
+                        self.last_porko_lobster = {}
+                    self.last_porko_lobster[chat_id] = datetime.now()
+                except Exception as e:
+                    print(f"Auto porko/lobster error: {e}")
+
+
+async def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Writer's Tears Telegram Bot")
+    parser.add_argument("--model", default="gpt-4o-mini", help="LLM model to use")
+    parser.add_argument("--no-rag", action="store_true", help="Disable RAG")
+    args = parser.parse_args()
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        print("Error: TELEGRAM_BOT_TOKEN not set")
+        return
 
     bot = TelegramWriterBot(
         telegram_token=token,
